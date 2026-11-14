@@ -1062,12 +1062,35 @@ function setVideo(url) {
   f.src = `https://www.youtube.com/embed/${id}?autoplay=1&mute=1&playsinline=1&enablejsapi=1&rel=0&controls=0&modestbranding=1${origin}`;
   f.allow = 'autoplay; encrypted-media; picture-in-picture';
   f.style.cssText = 'width:1280px;height:720px;border:0;pointer-events:none;';
-  f.addEventListener('load', () => { if (soundOn) setTimeout(() => ytCmd('unMute'), 600); ytCmd('playVideo'); });
+  f.addEventListener('load', () => {
+    ytState = -1; ytStuck = 0;
+    // 플레이어 상태를 받아보기 위해 등록
+    const hello = () => { if (ytFrame === f && f.contentWindow) f.contentWindow.postMessage(JSON.stringify({ event: 'listening', id: 1, channel: 'widget' }), '*'); };
+    hello(); setTimeout(hello, 500); setTimeout(hello, 1500);
+    if (soundOn) setTimeout(() => ytCmd('unMute'), 600);
+    ytCmd('playVideo');
+  });
   screenDiv.appendChild(f); ytFrame = f;
   screenPlaceholder.visible = false;
   $('soundBtn').classList.remove('hidden');
   $('soundBtn').classList.toggle('pulse', !soundOn);
 }
+// 영상이 멈추면 다시 재생시키는 감시견 (브라우저가 음소거 영상을 멋대로 멈추는 경우 대비)
+let ytState = -1, ytStuck = 0;
+addEventListener('message', e => {
+  if (!ytFrame || e.source !== ytFrame.contentWindow) return;
+  let d; try { d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data; } catch { return; }
+  if (!d) return;
+  if (d.event === 'onStateChange' && typeof d.info === 'number') ytState = d.info;
+  else if (d.event === 'infoDelivery' && d.info && typeof d.info.playerState === 'number') ytState = d.info.playerState;
+});
+setInterval(() => {
+  if (!ytFrame) return;
+  // 1 재생중, 3 버퍼링 → 정상 / 그 외(멈춤·대기)면 다시 재생
+  if (ytState === 1 || ytState === 3 || ytState === 0) { ytStuck = 0; return; }   // 0 = 영상 끝남
+  ytStuck++;
+  if (ytStuck >= 1) { if (soundOn) ytCmd('unMute'); else ytCmd('mute'); ytCmd('playVideo'); }
+}, 1200);
 function ytCmd(func, args = []) {
   if (!ytFrame || !ytFrame.contentWindow) return;
   ytFrame.contentWindow.postMessage(JSON.stringify({ event: 'command', func, args }), '*');
