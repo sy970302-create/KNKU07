@@ -124,7 +124,7 @@ button{font-family:inherit;cursor:pointer}
   "three":"https://cdn.jsdelivr.net/npm/three@0.170.0/build/three.module.js",
   "three/addons/":"https://cdn.jsdelivr.net/npm/three@0.170.0/examples/jsm/",
   "cannon-es":"https://cdn.jsdelivr.net/npm/cannon-es@0.20.0/dist/cannon-es.js",
-  "trystero":"https://cdn.jsdelivr.net/npm/trystero@0.25.4/+esm"
+  "mqtt":"https://cdn.jsdelivr.net/npm/mqtt@5.10.4/dist/mqtt.esm.js"
 }}
 </script>
 </head>
@@ -201,8 +201,9 @@ import * as CANNON from 'cannon-es';
 /* ============================================================
    설정
    ============================================================ */
-const APP_ID = 'knku07-leonids-popcorn-2026';
-const ROOM_ID = 'leonids-dome';
+// 공개 무료 MQTT 중계소 두 곳에 동시에 연결 (한 곳이 막혀도 다른 곳으로 만남)
+const BROKERS = (new URLSearchParams(location.search).get('broker') || 'wss://broker.emqx.io:8084/mqtt,wss://broker.hivemq.com:8884/mqtt').split(',');
+const TOPIC = 'knku07/leonids-dome/v2';
 const ADMIN_PW = '7412';
 const DOME_R = 26;
 const PLAY_R = 22.5;
@@ -1447,19 +1448,38 @@ function hitCandy(id, fromMe) {
 }
 
 /* ============================================================
-   네트워크 (Trystero P2P – 서버 없이 GitHub Pages에서 동작)
+   네트워크 (공개 MQTT 중계소 경유 – 서버 비용 0원, 휴대폰 데이터에서도 연결)
    ============================================================ */
-let room = null, selfId = 'me-' + Math.random().toString(36).slice(2, 9);
+let room = null;
+const selfId = 'p' + Math.random().toString(36).slice(2, 11);
 const peers = new Map();
-const A = {};
-function act(name) {
-  const a = room.makeAction(name);
-  return {
-    send: (d, target) => { try { a.send(d, target ? { target } : undefined); } catch (e) { } },
-    on: fn => { a.onMessage = (d, ctx) => fn(d, ctx && ctx.peerId !== undefined ? ctx.peerId : ctx); },
-  };
+const A = {}, handlers = {}, lastSeen = new Map(), seen = new Set(), seenQ = [];
+const clients = [];
+let seq = 0;
+['hello', 'mv', 'act', 'met', 'hit', 'clr', 'vid', 'st', 'cs', 'bye'].forEach(n => A[n] = { on: fn => handlers[n] = fn });
+function send(name, d, target) {
+  if (!room) return;
+  const msg = JSON.stringify({ k: name, f: selfId, s: ++seq, d });
+  const topic = target ? `${TOPIC}/to/${target}` : `${TOPIC}/all`;
+  for (const c of clients) if (c.connected) { try { c.publish(topic, msg, { qos: 0 }); } catch {} }
 }
-function send(name, d, target) { if (A[name]) A[name].send(d, target); }
+function onNetMessage(topic, buf) {
+  let m; try { m = JSON.parse(typeof buf === 'string' ? buf : new TextDecoder().decode(buf)); } catch { return; }
+  if (!m || typeof m.f !== 'string' || m.f === selfId || typeof m.k !== 'string') return;
+  const key = m.f + ':' + m.s;              // 두 중계소에서 같은 메시지가 두 번 오니까 한 번만 처리
+  if (seen.has(key)) return;
+  seen.add(key); seenQ.push(key); if (seenQ.length > 4000) seen.delete(seenQ.shift());
+  if (m.k === 'bye') { lastSeen.delete(m.f); dropPeer(m.f); return; }
+  const isNew = !lastSeen.has(m.f);
+  lastSeen.set(m.f, performance.now());
+  if (isNew) onPeerJoin(m.f);
+  const h = handlers[m.k]; if (h) { try { h(m.d, m.f); } catch (e) { console.warn(e); } }
+}
+function onPeerJoin(pid) {
+  send('hello', myHello(), pid);
+  // 새로 들어온 사람을 뺀 나머지 중 대표(관리자 우선)가 현재 상태를 넘겨줌
+  setTimeout(() => { if (authorityId(pid) === selfId) send('st', fullState(), pid); }, 900);
+}
 function myHello() { return { n: myNick, a: isAdmin, l: myLook }; }
 function isPeerAdmin(pid) { const p = peers.get(pid); return !!(p && p.a); }
 function authorityId(exclude) {
@@ -1488,13 +1508,23 @@ function applyState(s) {
   if (s.vid && s.vid.t > currentVid.t) { currentVid = s.vid; setVideo(currentVid.url); }
 }
 async function initNet() {
-  let T;
-  try { T = await import('trystero'); }
-  catch (e) { console.warn('trystero load failed', e); setNet('🔌 오프라인 (혼자 보는 중)'); return; }
-  try { room = T.joinRoom({ appId: APP_ID }, ROOM_ID); selfId = T.selfId; }
-  catch (e) { console.warn(e); setNet('🔌 오프라인 (혼자 보는 중)'); return; }
-  ['hello', 'mv', 'act', 'met', 'hit', 'clr', 'vid', 'st', 'cs', 'bye'].forEach(n => A[n] = act(n));
-
+  let mqtt;
+  try { mqtt = (await import('mqtt')).default; }
+  catch (e) { console.warn('mqtt load failed', e); setNet('🔌 오프라인 (혼자 보는 중)'); return; }
+  const will = { topic: `${TOPIC}/all`, payload: JSON.stringify({ k: 'bye', f: selfId, s: -1 }), qos: 0, retain: false };
+  for (const url of BROKERS) {
+    let c;
+    try { c = mqtt.connect(url, { clientId: 'knku07_' + selfId + '_' + clients.length, keepalive: 30, reconnectPeriod: 3000, connectTimeout: 8000, clean: true, will }); }
+    catch (e) { console.warn(e); continue; }
+    clients.push(c);
+    c.on('connect', () => {
+      c.subscribe([`${TOPIC}/all`, `${TOPIC}/to/${selfId}`], { qos: 0 });
+      room = true; setNet(); send('hello', myHello());
+    });
+    c.on('message', onNetMessage);
+    c.on('close', () => { if (!clients.some(x => x.connected)) { room = null; setNet('🔌 중계소 다시 연결 중…'); } });
+    c.on('error', e => console.warn('mqtt', url, e && e.message));
+  }
   A.hello.on((d, pid) => {
     const isNew = !peers.has(pid);
     peers.set(pid, { n: String(d.n || '사자').slice(0, 12), a: !!d.a, l: fixLook(d.l) });
@@ -1546,16 +1576,11 @@ async function initNet() {
     }
   });
   A.bye.on((d, pid) => dropPeer(pid));
-  room.onPeerJoin = pid => {
-    send('hello', myHello(), pid);
-    // 새로 들어온 사람을 뺀 나머지 중 대표(관리자 우선)가 현재 상태를 넘겨줌
-    setTimeout(() => { if (authorityId(pid) === selfId) send('st', fullState(), pid); }, 700);
-  };
-  room.onPeerLeave = pid => dropPeer(pid);
-  send('hello', myHello());
-  setInterval(() => send('hello', myHello()), 8000);
-  setNet();
-  window.addEventListener('beforeunload', () => { try { send('bye', 1); room.leave(); } catch {} });
+  setInterval(() => send('hello', myHello()), 4000);
+  // 오래 소식 없는 사람 정리 (창을 그냥 닫은 경우 대비)
+  setInterval(() => { const t = performance.now(); for (const [pid, ts] of lastSeen) if (t - ts > 75000) { lastSeen.delete(pid); dropPeer(pid); } }, 5000);
+  setTimeout(() => { if (!room) setNet('🔌 연결이 안 돼요 (새로고침 해봐요)'); }, 12000);
+  window.addEventListener('beforeunload', () => { try { send('bye', 1); clients.forEach(c => c.end(true)); } catch {} });
 }
 function dropPeer(pid) {
   const r = remotes.get(pid);
@@ -1889,7 +1914,7 @@ function onResize() {
   glow.mat.uniforms.uH.value = innerHeight;
 }
 
-let netT = 0, syncT = 0, fullSyncT = 0, wasAir = false;
+let netT = 0, syncT = 0, fullSyncT = 0, wasAir = false, lastMv = '';
 const _fwd = new THREE.Vector3(), _right = new THREE.Vector3(), _move = new THREE.Vector3();
 function loop() {
   const dt = Math.min(clock.getDelta(), 0.05);
@@ -1962,14 +1987,15 @@ function loop() {
 
   // --- 네트워크 송신 ---
   netT += dt;
-  if (room && netT > 1 / 12) {
-    netT = 0;
+  const mvNow = [myLion.root.position.x, myLion.root.position.y, myLion.root.position.z, myLion.facing, bites, giantPop, mySeat].map(String).join('|');
+  if (room && (netT > 1 || (netT > 1 / 8 && mvNow !== lastMv))) {
+    netT = 0; lastMv = mvNow;
     const L = myLion.root.position;
     send('mv', [+L.x.toFixed(2), +L.y.toFixed(2), +L.z.toFixed(2), +myLion.facing.toFixed(2), +hsp.toFixed(1), bites, grounded ? 0 : 1, giantPop ? 1 : 0, mySeat ? 1 : 0]);
   }
   if (room && amAuthority() && peers.size) {
     syncT += dt; fullSyncT += dt;
-    if (syncT > 0.2) {
+    if (syncT > 0.25) {
       const all = fullSyncT > 3; if (all) fullSyncT = 0; syncT = 0;
       const arr = [];
       for (const cd of candies.values()) {
